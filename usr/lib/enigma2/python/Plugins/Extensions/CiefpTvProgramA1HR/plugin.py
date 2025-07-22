@@ -14,7 +14,23 @@ from Plugins.Plugin import PluginDescriptor
 from Tools.LoadPixmap import LoadPixmap
 import datetime
 import time
-from lxml import etree
+import subprocess
+
+# Try to import lxml, install if not available
+try:
+    from lxml import etree
+    LXML_AVAILABLE = True
+except ImportError:
+    LXML_AVAILABLE = False
+    logging.getLogger("CiefpTvProgramA1HR").warning("lxml module not found, attempting to install...")
+    try:
+        subprocess.run(["pip3", "install", "lxml"], check=True, capture_output=True, text=True)
+        from lxml import etree
+        LXML_AVAILABLE = True
+        logging.getLogger("CiefpTvProgramA1HR").info("Successfully installed lxml")
+    except Exception as e:
+        logging.getLogger("CiefpTvProgramA1HR").error(f"Failed to install lxml: {str(e)}. Falling back to ElementTree")
+        LXML_AVAILABLE = False
 
 PLUGIN_PATH = "/usr/lib/enigma2/python/Plugins/Extensions/CiefpTvProgramA1HR"
 EPG_DIR = "/tmp/CiefpTvProgramA1HR"
@@ -24,13 +40,8 @@ EPG_URL = "https://epgshare01.online/epgshare01/epg_ripper_HR1.xml.gz"
 CACHE_TIME = 86400  # 24 hours caching
 
 # Configure logging for picons and critical errors only
-import logging
-
-# Ukloni sve postojeće handlere za root logger i specifični logger
 logging.getLogger('').handlers = []
-logging.getLogger("CiefpTVProgramA1HR").handlers = []
-
-# Postavi konfiguraciju logovanja
+logging.getLogger("CiefpTvProgramA1HR").handlers = []
 logging.basicConfig(
     level=logging.ERROR,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -40,15 +51,15 @@ logging.basicConfig(
     ],
     force=True
 )
-logger = logging.getLogger("CiefpTVProgramA1HR")
-logger.debug("Initializing CiefpTVProgramA1HR logger")
+logger = logging.getLogger("CiefpTvProgramA1HR")
+logger.debug("Initializing CiefpTvProgramA1HR logger")
 
 def clean_channel_name(name):
     return ''.join(e.lower() if e.isalnum() or e == '.' else '' for e in name).strip()
 
 class CiefpTvProgramA1HR(Screen):
     skin = """
-        <screen name="CiefpTvProgramA1HR" position="center,center" size="1800,800" title="..:: CiefpTvProgramA1HR v1.1 ::..">
+        <screen name="CiefpTvProgramA1HR" position="center,center" size="1800,800" title="..:: CiefpTvProgramA1HR v1.2 ::..">
             <widget name="channelList" position="0,0" size="350,668" scrollbarMode="showAlways" itemHeight="33" font="Regular;28" />
             <widget name="epgInfo" position="370,0" size="1000,668" scrollbarMode="showAlways" itemHeight="33" font="Regular;28" />
             <widget name="sideBackground" position="1380,0" size="420,668" alphatest="on" />
@@ -98,7 +109,6 @@ class CiefpTvProgramA1HR(Screen):
     def downloadAndParseData(self):
         cache_file = os.path.join(EPG_DIR, "epg_cache.xml")
         
-        # Check cache first
         if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file)) < CACHE_TIME:
             try:
                 with open(cache_file, 'r') as f:
@@ -112,7 +122,7 @@ class CiefpTvProgramA1HR(Screen):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124",
                 "Accept": "*/*",
-                "Accept-Encoding": "gzip, deflate",
+                "Accept newly added shows automatically": "gzip, deflate",
                 "Accept-Language": "en-US,en;q=0.5"
             }
             response = requests.get(EPG_URL, headers=headers, timeout=30)
@@ -138,27 +148,34 @@ class CiefpTvProgramA1HR(Screen):
 
     def parseXMLData(self, xml_data):
         try:
-            parser = etree.XMLParser(encoding='utf-8', recover=True)
-            tree = etree.fromstring(xml_data.encode('utf-8'), parser=parser)
+            if LXML_AVAILABLE:
+                parser = etree.XMLParser(encoding='utf-8', recover=True)
+                tree = etree.fromstring(xml_data.encode('utf-8'), parser=parser)
+                channel_iter = tree.xpath('//channel')
+                program_iter = tree.xpath('//programme')
+            else:
+                tree = ET.fromstring(xml_data)
+                channel_iter = tree.findall('.//channel')
+                program_iter = tree.findall('.//programme')
 
             self.channelData = []
             self.epgData = {}
 
-            for channel in tree.xpath('//channel'):
+            for channel in channel_iter:
                 channel_id = channel.get('id')
-                display_name = channel.xpath('display-name[1]/text()')
-                icon = channel.xpath('icon[1]/@src')
+                display_name = channel.find('display-name') if not LXML_AVAILABLE else channel.xpath('display-name[1]/text()')
+                icon = channel.find('icon') if not LXML_AVAILABLE else channel.xpath('icon[1]/@src')
 
-                if not channel_id or not display_name:
+                if not channel_id or display_name is None:
                     continue
 
-                channel_name = display_name[0].strip()
+                channel_name = display_name.text.strip() if not LXML_AVAILABLE else display_name[0].strip()
                 self.channelData.append({
                     "id": channel_id,
                     "title": channel_name,
                     "alias": clean_channel_name(channel_name),
                     "logo": f"{clean_channel_name(channel_name)}.png",
-                    "icon": icon[0] if icon else None
+                    "icon": icon.get('src') if icon is not None and not LXML_AVAILABLE else (icon[0] if icon else None)
                 })
                 self.epgData[channel_name] = []
 
@@ -169,16 +186,16 @@ class CiefpTvProgramA1HR(Screen):
 
             self["channelList"].setList([ch["title"] for ch in self.channelData])
 
-            for program in tree.xpath('//programme'):
+            for program in program_iter:
                 channel_id = program.get('channel')
                 start_time = program.get('start')
                 stop_time = program.get('stop')
-                title = program.xpath('title[1]/text()')
-                desc = program.xpath('desc[1]/text()')
-                category = program.xpath('category[1]/text()')
-                icon = program.xpath('icon[1]/@src')
+                title = program.find('title') if not LXML_AVAILABLE else program.xpath('title[1]/text()')
+                desc = program.find('desc') if not LXML_AVAILABLE else program.xpath('desc[1]/text()')
+                category = program.find('category') if not LXML_AVAILABLE else program.xpath('category[1]/text()')
+                icon = program.find('icon') if not LXML_AVAILABLE else program.xpath('icon[1]/@src')
 
-                if not (channel_id and start_time and title):
+                if not (channel_id and start_time and (title is not None if not LXML_AVAILABLE else title)):
                     continue
 
                 channel = next((ch for ch in self.channelData if ch['id'] == channel_id), None)
@@ -187,10 +204,10 @@ class CiefpTvProgramA1HR(Screen):
 
                 channel_name = channel['title']
                 program_data = {
-                    'title': title[0].strip() if title else "Nepoznat naslov",
-                    'desc': desc[0].strip() if desc else "Nema opisa",
-                    'category': category[0].strip() if category else "",
-                    'icon': icon[0] if icon else None
+                    'title': title.text.strip() if not LXML_AVAILABLE else (title[0].strip() if title else "Nepoznat naslov"),
+                    'desc': desc.text.strip() if desc is not None and not LXML_AVAILABLE else (desc[0].strip() if desc else "Nema opisa"),
+                    'category': category.text.strip() if category is not None and not LXML_AVAILABLE else (category[0].strip() if category else ""),
+                    'icon': icon.get('src') if icon is not None and not LXML_AVAILABLE else (icon[0] if icon else None)
                 }
 
                 try:
@@ -207,7 +224,7 @@ class CiefpTvProgramA1HR(Screen):
                     program_data['start_date'] = time_obj.strftime('%Y%m%d')
                     self.epgData[channel_name].append(program_data)
                 except ValueError as e:
-                    logger.error(f"Time parsing error for program {title[0] if title else 'unknown'}: {str(e)}")
+                    logger.error(f"Time parsing error for program {title.text if not LXML_AVAILABLE else (title[0] if title else 'unknown')}: {str(e)}")
                     continue
 
             self.updateEPGAndPicon()
@@ -451,7 +468,7 @@ def main(session, **kwargs):
 def Plugins(**kwargs):
     return [PluginDescriptor(
         name="CiefpTvProgramA1HR",
-        description="A1HR EPG plugin,epgshare v1.1",
+        description="A1HR EPG plugin,epgshare v1.2",
         where=PluginDescriptor.WHERE_PLUGINMENU,
         icon="icon.png",
         fnc=main
